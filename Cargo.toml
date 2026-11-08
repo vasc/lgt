@@ -1,12 +1,8 @@
 [package]
-name = "langelot"
+name = "lgt"
 version = "0.1.0"
 edition = "2024"
-description = "Langelot (lgt) — an observability-minded tee replacement with a live TUI"
-
-[[bin]]
-name = "lgt"
-path = "src/main.rs"
+description = "lgt — an observability-minded tee replacement with a live TUI"
 
 [dependencies]
 anyhow = "1.0.104"

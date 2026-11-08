@@ -1,4 +1,4 @@
-# Langelot (`lgt`)
+# lgt
 
 An observability-minded `tee` replacement. Everything piped through `lgt` is
 passed straight back out — and kept, so you can browse it, live-tail it, and

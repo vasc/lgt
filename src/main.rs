@@ -19,8 +19,8 @@ use store::Store;
 #[command(
     name = "lgt",
     version,
-    about = "Langelot — a smarter tee: capture piped data, then browse and watch it live",
-    long_about = "Langelot (lgt) is an observability-minded tee replacement.\n\
+    about = "lgt — a smarter tee: capture piped data, then browse and watch it live",
+    long_about = "lgt is an observability-minded tee replacement.\n\
         Piped input is passed straight through to stdout while a copy is kept\n\
         in a local store. Run `lgt` in a terminal to open the TUI and browse\n\
         or live-tail captures, including ones still being written.\n\n\
