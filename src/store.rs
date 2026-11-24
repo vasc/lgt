@@ -1,84 +1,66 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 
-/// Status as recorded by the capturing process itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Running,
-    Done,
-}
+pub use crate::meta::{Liveness, PipelineProc, Status, StreamMeta};
+pub use crate::settle::Observed;
 
-/// Status as observed from outside: a stream whose meta still says `Running`
-/// but whose pid is gone was killed before it could finalize.
+/// Which directory of the store a [`Store`] handle operates on. Captures
+/// always land on the active shelf; `lgt archive` moves finished streams to
+/// the archive shelf, which default listings and the TUI never scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liveness {
-    Running,
-    Done,
-    Died,
+pub enum Shelf {
+    Active,
+    Archive,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineProc {
-    pub pid: i32,
-    pub command: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamMeta {
-    pub id: String,
-    pub name: Option<String>,
-    pub group_id: String,
-    pub group_name: Option<String>,
-    pub pid: i32,
-    pub pgid: i32,
-    pub started_at_ms: i64,
-    pub ended_at_ms: Option<i64>,
-    pub status: Status,
-    pub bytes: u64,
-    pub lines: u64,
-    pub cwd: Option<String>,
-    /// Path of the `-o/--out` local copy, when one was requested.
-    #[serde(default)]
-    pub copy: Option<String>,
-    pub pipeline: Option<Vec<PipelineProc>>,
-}
-
-impl StreamMeta {
-    pub fn liveness(&self) -> Liveness {
-        match self.status {
-            Status::Done => Liveness::Done,
-            Status::Running => {
-                if crate::proc::alive(self.pid) {
-                    Liveness::Running
-                } else {
-                    Liveness::Died
-                }
-            }
-        }
-    }
-
-    pub fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.id)
-    }
-}
+/// Identity of a meta file's current contents (inode, length, mtime), used
+/// to skip re-parsing unchanged files. Every meta write is a rename, so the
+/// inode changes even where mtimes are coarse.
+pub type MetaStamp = (u64, u64, Option<SystemTime>);
 
 #[derive(Clone)]
 pub struct Store {
     root: PathBuf,
+    shelf: Shelf,
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn system_time_ms(time: SystemTime) -> Option<i64> {
+    let since_epoch = time.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
 }
 
 impl Store {
+    /// Open the store rooted at `root`, on the active shelf. The archive
+    /// directory is only created when something is first archived, so
+    /// opening a read-only store never writes.
     pub fn open(root: PathBuf) -> Result<Self> {
-        let store = Store { root };
-        fs::create_dir_all(store.streams_dir())
-            .with_context(|| format!("creating {}", store.streams_dir().display()))?;
-        fs::create_dir_all(store.groups_dir())
-            .with_context(|| format!("creating {}", store.groups_dir().display()))?;
+        let store = Store {
+            root,
+            shelf: Shelf::Active,
+        };
+        for dir in [store.streams_dir(), store.groups_dir()] {
+            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
         Ok(store)
+    }
+
+    /// A handle to the same store operating on another shelf.
+    pub fn on(&self, shelf: Shelf) -> Store {
+        Store {
+            root: self.root.clone(),
+            shelf,
+        }
+    }
+
+    pub fn shelf(&self) -> Shelf {
+        self.shelf
     }
 
     pub fn root(&self) -> &Path {
@@ -86,7 +68,10 @@ impl Store {
     }
 
     pub fn streams_dir(&self) -> PathBuf {
-        self.root.join("streams")
+        match self.shelf {
+            Shelf::Active => self.root.join("streams"),
+            Shelf::Archive => self.root.join("archive"),
+        }
     }
 
     pub fn groups_dir(&self) -> PathBuf {
@@ -115,14 +100,21 @@ impl Store {
     }
 
     /// Atomically (write temp + rename) publish a stream's metadata so
-    /// concurrent readers (the TUI) never observe a half-written file.
+    /// concurrent readers (the TUI) never observe a half-written file. The
+    /// temp name is unique per writer process and call, because recording a
+    /// death can race the capture's own writes.
     pub fn write_meta(&self, meta: &StreamMeta) -> Result<()> {
-        let tmp = self
-            .stream_dir(&meta.id)
-            .join(format!(".meta-{}.tmp", meta.pid));
+        let tmp = self.stream_dir(&meta.id).join(format!(
+            ".meta-{}-{}.tmp",
+            crate::proc::my_pid(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let body = serde_json::to_vec_pretty(meta)?;
         fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
         fs::rename(&tmp, self.meta_path(&meta.id))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp);
+            })
             .with_context(|| format!("publishing meta for {}", meta.id))
     }
 
@@ -132,24 +124,40 @@ impl Store {
         serde_json::from_slice(&body).with_context(|| format!("parsing {}", path.display()))
     }
 
-    pub fn list(&self) -> Result<Vec<StreamMeta>> {
-        let mut metas = Vec::new();
-        for entry in fs::read_dir(self.streams_dir())? {
+    pub fn meta_stamp(&self, id: &str) -> Option<MetaStamp> {
+        let meta = fs::metadata(self.meta_path(id)).ok()?;
+        Some((meta.ino(), meta.len(), meta.modified().ok()))
+    }
+
+    /// Every stream on this shelf, observed read-only.
+    pub fn list_observed(&self) -> Result<Vec<Observed>> {
+        let dir = self.streams_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+        };
+        let mut observed = Vec::new();
+        for entry in entries {
             let entry = entry?;
             let id = entry.file_name();
             let Some(id) = id.to_str() else { continue };
             if let Ok(meta) = self.read_meta(id) {
-                metas.push(meta);
+                observed.push(self.observe(meta));
             }
         }
-        Ok(metas)
+        Ok(observed)
+    }
+
+    pub fn list(&self) -> Result<Vec<StreamMeta>> {
+        Ok(self.list_observed()?.into_iter().map(|o| o.meta).collect())
     }
 
     /// Resolve a reference: an exact stream id wins, otherwise the most
     /// recently started stream carrying that name.
     pub fn resolve(&self, reference: &str) -> Result<StreamMeta> {
         if self.meta_path(reference).exists() {
-            return self.read_meta(reference);
+            return Ok(self.observe(self.read_meta(reference)?).meta);
         }
         let mut named: Vec<StreamMeta> = self
             .list()?
@@ -157,19 +165,69 @@ impl Store {
             .filter(|m| m.name.as_deref() == Some(reference))
             .collect();
         named.sort_by_key(|m| m.started_at_ms);
+        let shelf = match self.shelf {
+            Shelf::Active => "",
+            Shelf::Archive => " in the archive",
+        };
         named
             .pop()
-            .with_context(|| format!("no stream with id or name `{reference}`"))
+            .with_context(|| format!("no stream with id or name `{reference}`{shelf}"))
     }
 
     pub fn remove_stream(&self, id: &str) -> Result<()> {
-        fs::remove_dir_all(self.stream_dir(id)).with_context(|| format!("removing stream {id}"))
+        let dir = self.stream_dir(id);
+        // A concurrent meta writer can drop a temp file into the directory
+        // while it is being emptied; one retry clears it.
+        fs::remove_dir_all(&dir)
+            .or_else(|_| fs::remove_dir_all(&dir))
+            .with_context(|| format!("removing stream {id}"))
+    }
+
+    /// Move a stream to another shelf of the same store (a single rename).
+    pub fn move_stream(&self, id: &str, to: &Store) -> Result<()> {
+        let destination = to.stream_dir(id);
+        if destination.exists() {
+            bail!("stream {id} already exists in the destination");
+        }
+        fs::create_dir_all(to.streams_dir())
+            .with_context(|| format!("creating {}", to.streams_dir().display()))?;
+        fs::rename(self.stream_dir(id), &destination)
+            .with_context(|| format!("moving stream {id}"))?;
+        // A meta temp file inside the moved directory can only belong to a
+        // writer whose rename target (the old path) is gone: it is orphaned.
+        to.sweep_meta_temps(id, std::time::Duration::ZERO);
+        Ok(())
+    }
+
+    /// When a stream last wrote. Ages ("older than 24h") are measured from
+    /// here: a long job that just finished is not old, and neither is a busy
+    /// capture — but one stuck without output for weeks is.
+    pub fn last_activity_ms(&self, meta: &StreamMeta) -> i64 {
+        meta.finished_at_ms().unwrap_or_else(|| {
+            fs::metadata(self.data_path(&meta.id))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(system_time_ms)
+                .unwrap_or(meta.started_at_ms)
+        })
     }
 
     pub fn data_len(&self, id: &str) -> u64 {
         fs::metadata(self.data_path(id))
             .map(|m| m.len())
             .unwrap_or(0)
+    }
+
+    /// Disk footprint of a stream: every file in its directory.
+    pub fn stream_size(&self, id: &str) -> u64 {
+        let Ok(entries) = fs::read_dir(self.stream_dir(id)) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
     }
 
     /// Byte and line counts read from the data file itself. This is the
@@ -199,132 +257,10 @@ impl Store {
     }
 }
 
-/// Subcommand words can never name a capture: `lgt ls` must always mean the
-/// subcommand, never "capture a stream called ls".
-const RESERVED_NAMES: [&str; 7] = ["tui", "ls", "cat", "rm", "clean", "path", "help"];
-
-/// Validation for capture names, which share the root command line with
-/// subcommands.
-pub fn validate_stream_name(name: &str) -> Result<()> {
-    validate_name(name)?;
-    if RESERVED_NAMES.contains(&name) {
-        bail!(
-            "`{name}` is a reserved command word and cannot be used as a capture name; \
-             if you meant the `lgt {name}` subcommand, put options after it"
-        );
-    }
-    Ok(())
-}
-
-/// Names are referenced from the command line and shown in the TUI; keep them
-/// simple so they never need quoting.
-pub fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("name must not be empty");
-    }
-    if name.starts_with('-') {
-        bail!("name must not start with `-`");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        bail!("name may only contain letters, digits, `.`, `_` and `-`");
-    }
-    Ok(())
-}
+#[cfg(test)]
+#[path = "store_testutil.rs"]
+pub mod testutil;
 
 #[cfg(test)]
-pub mod testutil {
-    use super::Store;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    pub fn temp_store() -> Store {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("lgt-unit-{}-{n}", std::process::id()));
-        Store::open(dir).expect("temp store")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn meta(store: &Store, name: Option<&str>, started_at_ms: i64) -> StreamMeta {
-        let id = store.new_stream_id(crate::proc::my_pid(), started_at_ms);
-        StreamMeta {
-            id,
-            name: name.map(str::to_string),
-            group_id: "g-test".to_string(),
-            group_name: None,
-            pid: 1,
-            pgid: 1,
-            started_at_ms,
-            ended_at_ms: Some(started_at_ms),
-            status: Status::Done,
-            bytes: 0,
-            lines: 0,
-            cwd: None,
-            copy: None,
-            pipeline: None,
-        }
-    }
-
-    #[test]
-    fn meta_roundtrip() {
-        let store = testutil::temp_store();
-        let m = meta(&store, Some("build"), 1_000);
-        store.create_stream_dir(&m.id).unwrap();
-        store.write_meta(&m).unwrap();
-        let back = store.read_meta(&m.id).unwrap();
-        assert_eq!(back.id, m.id);
-        assert_eq!(back.name.as_deref(), Some("build"));
-        assert_eq!(back.status, Status::Done);
-    }
-
-    #[test]
-    fn resolve_prefers_exact_id_then_latest_name() {
-        let store = testutil::temp_store();
-        let older = meta(&store, Some("x"), 1_000);
-        let newer = meta(&store, Some("x"), 2_000);
-        for m in [&older, &newer] {
-            store.create_stream_dir(&m.id).unwrap();
-            store.write_meta(m).unwrap();
-        }
-        assert_eq!(store.resolve("x").unwrap().id, newer.id);
-        assert_eq!(store.resolve(&older.id).unwrap().id, older.id);
-        assert!(store.resolve("missing").is_err());
-    }
-
-    #[test]
-    fn dead_running_stream_reports_died() {
-        let store = testutil::temp_store();
-        let mut m = meta(&store, None, 1_000);
-        m.status = Status::Running;
-        m.pid = -1;
-        assert_eq!(m.liveness(), Liveness::Died);
-        m.pid = crate::proc::my_pid();
-        assert_eq!(m.liveness(), Liveness::Running);
-    }
-
-    #[test]
-    fn name_validation() {
-        assert!(validate_name("build.step_1-a").is_ok());
-        assert!(validate_name("").is_err());
-        assert!(validate_name("-x").is_err());
-        assert!(validate_name("a b").is_err());
-        assert!(validate_name("a/b").is_err());
-    }
-
-    #[test]
-    fn stream_names_exclude_command_words() {
-        assert!(validate_stream_name("build").is_ok());
-        for reserved in ["tui", "ls", "cat", "rm", "clean", "path", "help"] {
-            assert!(validate_stream_name(reserved).is_err(), "{reserved}");
-        }
-        // Group names are not restricted by the reserved list.
-        assert!(validate_name("ls").is_ok());
-    }
-}
+#[path = "store_tests.rs"]
+mod tests;

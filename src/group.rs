@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Store, validate_name};
+use crate::names::validate_name;
+use crate::store::Store;
 
 /// How long after its creation a pipeline-group claim stays joinable. All
 /// members of a shell pipeline are spawned together, so real siblings claim

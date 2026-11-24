@@ -1,104 +1,9 @@
-use std::fs;
+mod common;
+
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_lgt")
-}
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn temp_data_dir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("lgt-it-{}-{n}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-/// A `lgt` invocation with `args...` followed by `--data-dir`. The data-dir
-/// flag is global, so it is valid in this trailing position for both capture
-/// mode and every subcommand.
-fn lgt(data_dir: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(bin());
-    cmd.args(args);
-    cmd.arg("--data-dir").arg(data_dir);
-    cmd.env_remove("LGT_DATA_DIR");
-    cmd.env_remove("LGT_GROUP");
-    cmd
-}
-
-/// Pipe `input` through `lgt args...` and return its stdout.
-fn run_capture(data_dir: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-    let mut child = lgt(data_dir, args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let owned = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        stdin.write_all(&owned).unwrap();
-    });
-    let out = child.wait_with_output().unwrap();
-    writer.join().unwrap();
-    assert!(out.status.success(), "lgt exited with {:?}", out.status);
-    out.stdout
-}
-
-fn stream_ids(data_dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(data_dir.join("streams")) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = entries
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    ids.sort();
-    ids
-}
-
-fn read_meta(data_dir: &Path, id: &str) -> serde_json::Value {
-    let body = fs::read(data_dir.join("streams").join(id).join("meta.json")).unwrap();
-    serde_json::from_slice(&body).unwrap()
-}
-
-#[test]
-fn passthrough_and_capture_with_name() {
-    let dir = temp_data_dir();
-    let input = b"hello\nworld\n";
-    let out = run_capture(&dir, &["greeting"], input);
-    assert_eq!(out, input, "stdin must be piped back out unchanged");
-
-    let ids = stream_ids(&dir);
-    assert_eq!(ids.len(), 1);
-    let id = &ids[0];
-    let data = fs::read(dir.join("streams").join(id).join("data.log")).unwrap();
-    assert_eq!(data, input, "captured log must match the piped input");
-
-    let meta = read_meta(&dir, id);
-    assert_eq!(meta["name"], "greeting");
-    assert_eq!(meta["status"], "done");
-    assert_eq!(meta["bytes"], 12);
-    assert_eq!(meta["lines"], 2);
-    assert!(meta["ended_at_ms"].is_i64());
-}
-
-#[test]
-fn binary_data_survives_roundtrip() {
-    let dir = temp_data_dir();
-    let mut input = Vec::new();
-    for _ in 0..3 {
-        for b in 0..=255u8 {
-            input.push(b);
-        }
-    }
-    let out = run_capture(&dir, &[], &input);
-    assert_eq!(out, input);
-    let ids = stream_ids(&dir);
-    let data = fs::read(dir.join("streams").join(&ids[0]).join("data.log")).unwrap();
-    assert_eq!(data, input);
-}
+use common::{bin, lgt, read_meta, run_capture, stream_ids, temp_data_dir};
 
 #[test]
 fn cat_resolves_latest_by_name_and_exact_id() {
@@ -144,72 +49,6 @@ fn manual_group_links_across_pipelines() {
         assert_eq!(meta["group_id"], "named-deploy");
         assert_eq!(meta["group_name"], "deploy");
     }
-}
-
-#[test]
-fn invalid_names_are_rejected() {
-    let dir = temp_data_dir();
-    let mut child = lgt(&dir, &["bad name"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdin.take());
-    let out = child.wait_with_output().unwrap();
-    assert!(!out.status.success());
-    assert!(stream_ids(&dir).is_empty(), "no stream should be created");
-}
-
-#[test]
-fn broken_downstream_stops_capture_like_tee() {
-    let dir = temp_data_dir();
-    let mut child = lgt(&dir, &[])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // Simulate `lgt | head -c0`: downstream goes away immediately.
-    drop(child.stdout.take());
-    let mut stdin = child.stdin.take().unwrap();
-    let chunk = vec![b'x'; 64 * 1024];
-    // lgt should exit once it notices stdout is gone; our writes then fail
-    // with a broken pipe. Bound the loop so a regression can't hang the test.
-    let mut wrote_err = false;
-    for _ in 0..256 {
-        if stdin.write_all(&chunk).is_err() {
-            wrote_err = true;
-            break;
-        }
-    }
-    drop(stdin);
-    let status = child.wait().unwrap();
-    // tee dies of SIGPIPE (status 141) in this situation; lgt reports the
-    // same so `set -o pipefail` treats both identically.
-    assert_eq!(status.code(), Some(141));
-    assert!(wrote_err, "lgt kept reading after downstream closed");
-    let ids = stream_ids(&dir);
-    assert_eq!(read_meta(&dir, &ids[0])["status"], "done");
-}
-
-#[test]
-fn drain_keeps_capturing_after_downstream_closes() {
-    let dir = temp_data_dir();
-    let mut child = lgt(&dir, &["--drain"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    drop(child.stdout.take());
-    let mut stdin = child.stdin.take().unwrap();
-    let payload = vec![b'y'; 256 * 1024];
-    stdin.write_all(&payload).unwrap();
-    drop(stdin);
-    let status = child.wait().unwrap();
-    assert!(status.success());
-    let ids = stream_ids(&dir);
-    let data = fs::read(dir.join("streams").join(&ids[0]).join("data.log")).unwrap();
-    assert_eq!(data.len(), payload.len(), "--drain must capture everything");
 }
 
 #[test]
@@ -279,7 +118,7 @@ fn ls_rm_and_clean() {
     assert!(out.status.success());
     assert_eq!(stream_ids(&dir).len(), 1);
 
-    let out = lgt(&dir, &["clean"]).output().unwrap();
+    let out = lgt(&dir, &["clean", "--everything"]).output().unwrap();
     assert!(out.status.success());
     assert!(stream_ids(&dir).is_empty());
 }
@@ -291,54 +130,6 @@ fn lgt_path_prints_the_data_dir() {
     assert!(out.status.success());
     let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(printed, dir.display().to_string());
-}
-
-#[test]
-fn killed_capture_reports_died_with_real_counts() {
-    let dir = temp_data_dir();
-    let mut child = lgt(&dir, &["doomed"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"one\ntwo\n").unwrap();
-    stdin.flush().unwrap();
-    // Give the capture a moment to persist the chunk, then kill it hard so
-    // it never finalizes its metadata.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let ids = stream_ids(&dir);
-        if !ids.is_empty()
-            && fs::metadata(dir.join("streams").join(&ids[0]).join("data.log"))
-                .map(|m| m.len())
-                .unwrap_or(0)
-                == 8
-        {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "capture never landed");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    child.kill().unwrap();
-    child.wait().unwrap();
-    drop(stdin);
-
-    let out = lgt(&dir, &["ls"]).output().unwrap();
-    assert!(out.status.success());
-    let listing = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(listing.contains("died"), "status wrong:\n{listing}");
-    assert!(
-        listing.contains("8B"),
-        "bytes must come from the data file, not stale meta:\n{listing}"
-    );
-    let lines_col: Vec<&str> = listing.lines().collect();
-    assert!(
-        lines_col
-            .iter()
-            .any(|l| l.contains("doomed") && l.contains(" 2 ")),
-        "line count must come from the data file:\n{listing}"
-    );
 }
 
 #[test]
@@ -449,20 +240,6 @@ fn concurrent_pipeline_instances_share_a_group() {
 }
 
 #[test]
-fn out_flag_writes_a_local_copy_too() {
-    let dir = temp_data_dir();
-    let copy_path = dir.join("local-copy.log");
-    let copy_arg = copy_path.display().to_string();
-    let out = run_capture(&dir, &["copied", "-o", &copy_arg], b"kept twice\n");
-    assert_eq!(out, b"kept twice\n");
-    assert_eq!(fs::read(&copy_path).unwrap(), b"kept twice\n");
-    let ids = stream_ids(&dir);
-    let data = fs::read(dir.join("streams").join(&ids[0]).join("data.log")).unwrap();
-    assert_eq!(data, b"kept twice\n", "the store copy is still primary");
-    assert_eq!(read_meta(&dir, &ids[0])["copy"], copy_arg);
-}
-
-#[test]
 fn tui_refuses_to_run_without_a_terminal() {
     let dir = temp_data_dir();
     let out = lgt(&dir, &["tui"]).output().unwrap();
@@ -486,20 +263,4 @@ fn global_flag_before_subcommand_still_selects_the_subcommand() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"payload\n");
-}
-
-#[test]
-fn pipeline_snapshot_is_recorded() {
-    let dir = temp_data_dir();
-    run_capture(&dir, &["snap"], b"x\n");
-    let ids = stream_ids(&dir);
-    let meta = read_meta(&dir, &ids[0]);
-    let pipeline = meta["pipeline"].as_array().expect("pipeline snapshot");
-    // The test binary itself is part of the process group.
-    assert!(
-        pipeline
-            .iter()
-            .any(|p| p["command"].as_str().unwrap_or("").contains("cli")),
-        "snapshot should include the test process: {pipeline:?}"
-    );
 }

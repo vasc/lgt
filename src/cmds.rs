@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::store::{Liveness, Store, StreamMeta};
-use crate::{group, timefmt, units};
+use crate::store::{Liveness, Shelf, Store, StreamMeta};
+use crate::{timefmt, units};
 
-fn liveness_label(meta: &StreamMeta) -> &'static str {
-    match meta.liveness() {
+fn liveness_label(liveness: Liveness) -> &'static str {
+    match liveness {
         Liveness::Running => "running",
         Liveness::Done => "done",
         Liveness::Died => "died",
@@ -15,10 +15,15 @@ fn liveness_label(meta: &StreamMeta) -> &'static str {
 }
 
 pub fn ls(store: &Store) -> Result<()> {
-    let mut streams = store.list()?;
-    streams.sort_by_key(|m| std::cmp::Reverse(m.started_at_ms));
+    let mut streams = store.list_observed()?;
+    streams.sort_by_key(|o| std::cmp::Reverse(o.meta.started_at_ms));
     if streams.is_empty() {
-        println!("no streams captured yet — pipe something through `lgt` first");
+        match store.shelf() {
+            Shelf::Active => {
+                println!("no streams captured yet — pipe something through `lgt` first");
+            }
+            Shelf::Archive => println!("the archive is empty"),
+        }
         return Ok(());
     }
     let mut rows = vec![[
@@ -30,19 +35,28 @@ pub fn ls(store: &Store) -> Result<()> {
         "LINES".to_string(),
         "BYTES".to_string(),
     ]];
-    for m in &streams {
-        // Finalized streams carry their true counters; anything else (still
-        // running, or killed before finalizing) is measured from the data
-        // file itself.
-        let (bytes, lines) = match m.liveness() {
-            Liveness::Done => (m.bytes, m.lines),
-            _ => store.data_stats(&m.id),
+    for observed in &streams {
+        let m = &observed.meta;
+        let liveness = m.liveness();
+        // Counters in meta are final for finished streams. A dead capture
+        // seen for the first time has its death recorded now (counting its
+        // lines once, so later listings are cheap); a running stream is
+        // measured from its data file.
+        let (bytes, lines) = if observed.died_unrecorded {
+            match store.record_death(&m.id) {
+                Some(recorded) => (recorded.bytes, recorded.lines),
+                None => store.data_stats(&m.id),
+            }
+        } else if liveness == Liveness::Running {
+            store.data_stats(&m.id)
+        } else {
+            (m.bytes, m.lines)
         };
         rows.push([
             m.id.clone(),
             m.name.clone().unwrap_or_else(|| "-".to_string()),
             m.group_name.clone().unwrap_or_else(|| m.group_id.clone()),
-            liveness_label(m).to_string(),
+            liveness_label(liveness).to_string(),
             timefmt::clock(m.started_at_ms),
             lines.to_string(),
             units::human_bytes(bytes),
@@ -64,8 +78,26 @@ pub fn ls(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a reference for reading. On the active shelf, an exact stream id
+/// that has been archived is still found, so ids printed by
+/// `lgt ls --archived` can be read without repeating the flag. Names only
+/// resolve on the shelf being queried.
+fn resolve_for_reading(store: &Store, reference: &str) -> Result<(Store, StreamMeta)> {
+    match store.resolve(reference) {
+        Ok(meta) => Ok((store.clone(), meta)),
+        Err(err) => {
+            let archive = store.on(Shelf::Archive);
+            if store.shelf() == Shelf::Active && archive.meta_path(reference).exists() {
+                let meta = archive.read_meta(reference)?;
+                return Ok((archive, meta));
+            }
+            Err(err)
+        }
+    }
+}
+
 pub fn cat(store: &Store, reference: &str, follow: bool) -> Result<()> {
-    let meta = store.resolve(reference)?;
+    let (store, meta) = resolve_for_reading(store, reference)?;
     let path = store.data_path(&meta.id);
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
@@ -126,19 +158,6 @@ pub fn rm(store: &Store, references: &[String], force: bool) -> Result<()> {
         store.remove_stream(&meta.id)?;
         println!("removed {}", meta.id);
     }
-    Ok(())
-}
-
-pub fn clean(store: &Store, all: bool) -> Result<()> {
-    let mut removed = 0u64;
-    for meta in store.list()? {
-        if all || meta.liveness() != Liveness::Running {
-            store.remove_stream(&meta.id)?;
-            removed += 1;
-        }
-    }
-    group::prune_stale_claims(store, timefmt::now_ms());
-    println!("removed {removed} stream(s)");
     Ok(())
 }
 

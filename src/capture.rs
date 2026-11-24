@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::store::{Status, Store, StreamMeta, validate_stream_name};
+use crate::names::validate_stream_name;
+use crate::store::{Status, Store, StreamMeta};
 use crate::{group, proc, timefmt};
 
 pub struct CaptureOpts {
@@ -46,6 +47,8 @@ pub fn run(store: &Store, opts: CaptureOpts) -> Result<CaptureOutcome> {
         group_name: group.name,
         pid,
         pgid,
+        machine: proc::machine_id().map(str::to_string),
+        pid_ns: proc::pid_namespace().map(str::to_string),
         started_at_ms,
         ended_at_ms: None,
         status: Status::Running,
@@ -114,10 +117,13 @@ pub fn run(store: &Store, opts: CaptureOpts) -> Result<CaptureOutcome> {
             pump_result?;
             return Err(err);
         }
-        // The stream was removed while we were running (`lgt rm -f` /
-        // `lgt clean --all`). Losing the log was the user's call; the
+        // The stream directory went away while we were running (`lgt rm -f`,
+        // `lgt clean --include-running`). That was the user's call; the
         // pipeline itself must keep working.
-        eprintln!("lgt: capture {id} was removed while running; log discarded");
+        eprintln!(
+            "lgt: the store directory of capture {id} disappeared while it was running; \
+             its final metadata was not written"
+        );
     }
     pump_result
 }

@@ -9,15 +9,67 @@ pub fn my_pgid() -> i32 {
     unsafe { libc::getpgrp() }
 }
 
+/// Whether a process with this pid exists. EPERM (it exists but belongs to
+/// another user) counts as alive: a "died" verdict is persisted and makes a
+/// stream eligible for archiving and deletion, so when unsure we must err
+/// towards "still running".
 pub fn alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // SAFETY: kill with signal 0 performs permission/existence checks only.
-    // EPERM (exists, different owner) counts as dead: captures always run as
-    // the store's owner, so a foreign-owned pid can only be a recycled one.
+    // SAFETY: kill with signal 0 sends nothing; it only performs the
+    // existence/permission check on a plain integer pid.
     let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// A stable identifier of this machine, read once. Captures record it so
+/// that a store shared between machines (NFS home, container mounts) never
+/// probes a pid that belongs to another machine. Unlike the hostname, it
+/// does not change with the network the machine is on.
+pub fn machine_id() -> Option<&'static str> {
+    static MACHINE_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    MACHINE_ID.get_or_init(read_machine_id).as_deref()
+}
+
+/// This process's PID namespace (Linux), e.g. `pid:[4026531836]`. Two
+/// containers on one machine — even sharing a machine id, or having none —
+/// see different pids for the same process; a pid recorded in another
+/// namespace means nothing here. `None` where there are no namespaces.
+pub fn pid_namespace() -> Option<&'static str> {
+    static PID_NS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PID_NS
+        .get_or_init(|| {
+            std::fs::read_link("/proc/self/ns/pid")
+                .ok()
+                .map(|target| target.to_string_lossy().into_owned())
+        })
+        .as_deref()
+}
+
+/// The hardware UUID (the one `ioreg` reports as IOPlatformUUID).
+#[cfg(target_os = "macos")]
+fn read_machine_id() -> Option<String> {
+    let mut uuid = [0u8; 16];
+    let wait = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    // SAFETY: `uuid` is a live, writable 16-byte buffer — exactly the
+    // `uuid_t` gethostuuid fills — and `wait` is a valid timespec that
+    // outlives the call.
+    let rc = unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &wait) };
+    (rc == 0).then(|| uuid.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// systemd's machine id (or D-Bus's, on systems without systemd).
+#[cfg(not(target_os = "macos"))]
+fn read_machine_id() -> Option<String> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|id| id.trim().to_ascii_lowercase())
+        .filter(|id| !id.is_empty())
 }
 
 /// Merge two pipeline snapshots keyed by pid. Entries only present in one
@@ -79,6 +131,68 @@ mod tests {
     #[test]
     fn own_process_is_alive() {
         assert!(alive(my_pid()));
+    }
+
+    #[test]
+    fn processes_owned_by_someone_else_count_as_alive() {
+        // pid 1 (init/launchd) always exists and belongs to root: as a normal
+        // user the probe fails with EPERM, which must not read as "dead".
+        assert!(alive(1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn machine_id_is_the_hardware_uuid() {
+        let ours = machine_id().expect("machine id");
+        let out = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text
+            .lines()
+            .find(|l| l.contains("IOPlatformUUID"))
+            .expect("ioreg reports IOPlatformUUID");
+        let theirs: String = line
+            .rsplit('"')
+            .nth(1)
+            .unwrap()
+            .chars()
+            .filter(|c| *c != '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        assert_eq!(ours, theirs);
+        assert_eq!(machine_id(), Some(ours), "cached value is stable");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn machine_id_is_the_systemd_machine_id_when_there_is_one() {
+        // Minimal container images often have neither file.
+        let theirs = std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .ok()
+            .map(|id| id.trim().to_ascii_lowercase())
+            .filter(|id| !id.is_empty());
+        assert_eq!(machine_id(), theirs.as_deref());
+    }
+
+    #[test]
+    fn pid_namespace_is_a_namespace_inode_on_linux_and_absent_elsewhere() {
+        let ns = pid_namespace();
+        if cfg!(target_os = "linux") {
+            let ns = ns.expect("Linux exposes /proc/self/ns/pid");
+            let inode = ns
+                .strip_prefix("pid:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("unexpected namespace format: {ns}"));
+            assert!(
+                !inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit()),
+                "{ns}"
+            );
+        } else {
+            assert_eq!(ns, None, "no PID namespaces outside Linux");
+        }
     }
 
     #[test]
